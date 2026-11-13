@@ -4,17 +4,28 @@ MKVCBot - Discord Voice Bot for MKTRADEZ
 - Loops continuously as long as human members are present in the channel.
 - Goes silent when alone in the VC; automatically resumes when someone joins.
 - Tagged commands: @bot start, @bot disconnect (or @bot diconnect).
-- Strictly admin-only (Administrator permission required).
+- Strictly admin-only (Administrator or Guild Owner required).
 - Completely silent in text (sends zero text messages).
 """
 
 import os
+import sys
+import shutil
 import asyncio
 import logging
+import glob
+import subprocess
 from typing import Optional
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("MKVCBot")
 
 # Optional TTS engines
 try:
@@ -29,18 +40,12 @@ try:
 except ImportError:
     HAS_GTTS = False
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
-logger = logging.getLogger("MKVCBot")
-
 # Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 TTS_VOICE = os.getenv("TTS_VOICE", "en-US-ChristopherNeural")
-AUDIO_FILE = os.getenv("AUDIO_FILE", "mktradez_speech.mp3")
+AUDIO_FILE_MP3 = "mktradez_speech.mp3"
+AUDIO_FILE_WAV = "mktradez_speech.wav"
 
 # Script to read
 SPEECH_TEXT = (
@@ -62,32 +67,70 @@ bot = commands.Bot(command_prefix="", intents=intents)
 guild_loops = {}
 
 
-async def generate_speech_file():
-    """Generates the speech audio file if it doesn't already exist."""
-    if os.path.exists(AUDIO_FILE):
-        logger.info(f"Audio file '{AUDIO_FILE}' already exists. Using cached audio.")
-        return
+def find_ffmpeg() -> str:
+    """Finds ffmpeg executable on Windows or Linux."""
+    if os.path.exists("ffmpeg.exe"):
+        return os.path.abspath("ffmpeg.exe")
 
-    logger.info(f"Generating TTS audio file '{AUDIO_FILE}'...")
-    if HAS_EDGE_TTS:
-        try:
-            communicate = edge_tts.Communicate(SPEECH_TEXT, TTS_VOICE)
-            await communicate.save(AUDIO_FILE)
-            logger.info("Generated high-quality Edge TTS audio successfully.")
-            return
-        except Exception as e:
-            logger.warning(f"Edge TTS failed ({e}), attempting gTTS fallback...")
+    ffmpeg_cmd = shutil.which("ffmpeg")
+    if ffmpeg_cmd:
+        return ffmpeg_cmd
 
-    if HAS_GTTS:
-        try:
-            tts = gTTS(text=SPEECH_TEXT, lang='en', slow=False)
-            tts.save(AUDIO_FILE)
-            logger.info("Generated gTTS audio fallback successfully.")
-            return
-        except Exception as e:
-            logger.error(f"gTTS also failed: {e}")
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    if local_app_data:
+        winget_pattern = os.path.join(local_app_data, "Microsoft", "WinGet", "Packages", "Gyan.FFmpeg*", "*", "bin", "ffmpeg.exe")
+        matches = glob.glob(winget_pattern)
+        if matches:
+            return matches[0]
 
-    logger.warning("No TTS engine available or generation failed. Ensure audio file exists or install edge-tts/gTTS.")
+    return "ffmpeg"
+
+
+FFMPEG_EXECUTABLE = find_ffmpeg()
+
+
+async def prepare_audio():
+    """Generates the speech audio file and pre-encodes to 48kHz stereo WAV for Discord."""
+    # 1. Generate MP3 if missing
+    if not os.path.exists(AUDIO_FILE_MP3):
+        logger.info(f"Generating TTS audio file '{AUDIO_FILE_MP3}'...")
+        if HAS_EDGE_TTS:
+            try:
+                communicate = edge_tts.Communicate(SPEECH_TEXT, TTS_VOICE)
+                await communicate.save(AUDIO_FILE_MP3)
+                logger.info("Generated high-quality Edge TTS audio successfully.")
+            except Exception as e:
+                logger.warning(f"Edge TTS failed ({e}), attempting gTTS fallback...")
+
+        if not os.path.exists(AUDIO_FILE_MP3) and HAS_GTTS:
+            try:
+                tts = gTTS(text=SPEECH_TEXT, lang='en', slow=False)
+                tts.save(AUDIO_FILE_MP3)
+                logger.info("Generated gTTS audio fallback successfully.")
+            except Exception as e:
+                logger.error(f"gTTS failed: {e}")
+
+    # 2. Pre-encode to 48kHz stereo 16-bit WAV with volume boost for crystal clear Discord transmission
+    try:
+        cmd = [
+            FFMPEG_EXECUTABLE,
+            "-y",
+            "-i", AUDIO_FILE_MP3,
+            "-ar", "48000",
+            "-ac", "2",
+            "-filter:a", "volume=2.2",
+            AUDIO_FILE_WAV
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        logger.info(f"Pre-encoded audio to 48kHz stereo WAV '{AUDIO_FILE_WAV}' with +120% volume boost.")
+    except Exception as e:
+        logger.warning(f"Could not pre-encode to WAV ({e}), will use MP3 directly.")
+
+
+def get_active_audio_path() -> str:
+    if os.path.exists(AUDIO_FILE_WAV):
+        return os.path.abspath(AUDIO_FILE_WAV)
+    return os.path.abspath(AUDIO_FILE_MP3)
 
 
 def has_humans(vc: discord.VoiceClient) -> bool:
@@ -117,7 +160,8 @@ async def voice_playback_loop(guild_id: int):
 
             if has_humans(vc):
                 if not vc.is_playing() and not vc.is_paused():
-                    if os.path.exists(AUDIO_FILE):
+                    audio_path = get_active_audio_path()
+                    if os.path.exists(audio_path):
                         done_event = asyncio.Event()
 
                         def after_playback(error):
@@ -127,26 +171,34 @@ async def voice_playback_loop(guild_id: int):
 
                         try:
                             source = discord.FFmpegPCMAudio(
-                                AUDIO_FILE,
-                                options='-filter:a "volume=1.0"'
+                                audio_path,
+                                executable=FFMPEG_EXECUTABLE
                             )
+                            logger.info(f"Speaking text in VC '{vc.channel.name}'...")
                             vc.play(source, after=after_playback)
-                            await done_event.wait()
+
+                            # Wait for audio to finish, with a 35s safety timeout
+                            try:
+                                await asyncio.wait_for(done_event.wait(), timeout=35.0)
+                            except asyncio.TimeoutError:
+                                logger.warning("Playback timeout reached, cycling loop.")
+
                         except Exception as e:
-                            logger.error(f"Error during audio play: {e}")
+                            logger.error(f"Error starting audio play: {e}")
                             await asyncio.sleep(2)
 
-                        # Small pause between loops to sound natural
+                        # Natural pause between speech loops
                         await asyncio.sleep(2)
                     else:
-                        logger.warning(f"Audio file '{AUDIO_FILE}' missing. Regenerating...")
-                        await generate_speech_file()
+                        logger.warning(f"Audio file '{audio_path}' missing. Regenerating...")
+                        await prepare_audio()
                         await asyncio.sleep(3)
                 else:
                     await asyncio.sleep(1)
             else:
                 # Bot is alone in VC: stop playback and wait silently
                 if vc.is_playing():
+                    logger.info("Bot is alone in VC. Pausing audio until a member joins.")
                     vc.stop()
                 await asyncio.sleep(2)
 
@@ -165,8 +217,12 @@ def ensure_voice_loop(guild_id: int):
 
 @bot.event
 async def on_ready():
-    logger.info(f"Bot connected successfully as {bot.user} (ID: {bot.user.id})")
-    await generate_speech_file()
+    logger.info(f"====== MKVCBOT IS ONLINE ======")
+    logger.info(f"Logged in as: {bot.user.name}#{bot.user.discriminator} (ID: {bot.user.id})")
+    logger.info(f"Connected to {len(bot.guilds)} server(s): {[g.name for g in bot.guilds]}")
+    logger.info(f"FFmpeg executable: {FFMPEG_EXECUTABLE}")
+    await prepare_audio()
+    logger.info("Ready to receive '@bot start' command from Server Admins.")
 
 
 @bot.event
@@ -194,7 +250,7 @@ async def on_message(message: discord.Message):
     Handles tag commands:
     - @bot start
     - @bot disconnect / @bot diconnect
-    Strictly Administrator-only.
+    Strictly Administrator or Guild Owner only.
     Zero text response sent (voice-only bot).
     """
     if message.author.bot or not message.guild:
@@ -204,17 +260,20 @@ async def on_message(message: discord.Message):
     if bot.user not in message.mentions:
         return
 
-    # STRICT SECURITY CHECK: Must have Administrator permission
-    if not message.author.guild_permissions.administrator:
-        # Non-admin: silently ignore to prevent unauthorized use
+    # STRICT SECURITY CHECK: Must have Administrator permission or be server owner
+    is_admin = message.author.guild_permissions.administrator or (message.author.id == message.guild.owner_id)
+    if not is_admin:
+        logger.warning(f"Ignored non-admin mention from {message.author.name}")
         return
 
     content_clean = message.content.lower().replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
+    logger.info(f"Admin command received from {message.author.name}: '{content_clean}'")
 
     # Command: start
     if "start" in content_clean:
         if message.author.voice and message.author.voice.channel:
             target_channel = message.author.voice.channel
+            logger.info(f"Joining voice channel: '{target_channel.name}'")
             vc: Optional[discord.VoiceClient] = message.guild.voice_client
 
             if vc and vc.is_connected():
@@ -228,11 +287,14 @@ async def on_message(message: discord.Message):
                     return
 
             ensure_voice_loop(message.guild.id)
+        else:
+            logger.warning(f"Admin {message.author.name} issued start but is not currently in a voice channel.")
 
     # Command: disconnect / diconnect
     elif "disconnect" in content_clean or "diconnect" in content_clean:
         vc: Optional[discord.VoiceClient] = message.guild.voice_client
         if vc and vc.is_connected():
+            logger.info("Disconnecting from voice channel...")
             task = guild_loops.pop(message.guild.id, None)
             if task and not task.done():
                 task.cancel()
@@ -244,7 +306,7 @@ async def on_message(message: discord.Message):
 if __name__ == "__main__":
     if not BOT_TOKEN:
         logger.error("DISCORD_BOT_TOKEN environment variable is missing! Check .env file.")
-        exit(1)
+        sys.exit(1)
 
     try:
         bot.run(BOT_TOKEN)
