@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MKVCBot - Status & Ping Service</title>
+  <style>
+    :root {
+      --bg: #090a0f;
+      --card: #12141f;
+      --border: #1e2238;
+      --primary: #00f2fe;
+      --accent: #4facfe;
+      --text: #f0f4f8;
+      --muted: #8a99ad;
+      --success: #00ff88;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    body {
+      background: radial-gradient(circle at top, #14172b, var(--bg));
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .container {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      max-width: 620px;
+      width: 100%;
+      padding: 36px;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(0, 255, 136, 0.12);
+      color: var(--success);
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 20px;
+      border: 1px solid rgba(0, 255, 136, 0.25);
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      background: var(--success);
+      border-radius: 50%;
+      box-shadow: 0 0 10px var(--success);
+      animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(0.8); }
+    }
+    h1 {
+      font-size: 28px;
+      font-weight: 700;
+      margin-bottom: 8px;
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    p.desc {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+      margin-bottom: 24px;
+    }
+    .endpoint-box {
+      background: #0d0f17;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 24px;
+    }
+    .endpoint-code {
+      font-family: monospace;
+      color: var(--primary);
+      font-size: 14px;
+    }
+    .copy-btn {
+      background: #1b2033;
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 6px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+      transition: all 0.2s;
+    }
+    .copy-btn:hover {
+      background: var(--primary);
+      color: #000;
+    }
+    .features {
+      list-style: none;
+      border-top: 1px solid var(--border);
+      padding-top: 20px;
+      display: grid;
+      gap: 12px;
+    }
+    .features li {
+      font-size: 13px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .features li span {
+      color: var(--primary);
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="badge">
+      <span class="dot"></span>
+      SERVICE OPERATIONAL
+    </div>
+    <h1>MKVCBot Keep-Alive Ping</h1>
+    <p class="desc">
+      High-performance Discord voice automation ping service for <strong>MKTRADEZ</strong>.
+      Use this endpoint in UptimeRobot, Cron-Job.org, or any HTTP ping monitor.
+    </p>
+
+    <div class="endpoint-box">
+      <span class="endpoint-code" id="pingUrl">/ping</span>
+      <button class="copy-btn" onclick="copyPing()">Copy URL</button>
+    </div>
+
+    <ul class="features">
+      <li><span>✓</span> Continuous voice looping when users are present</li>
+      <li><span>✓</span> Auto-silence when the bot is alone in VC</li>
+      <li><span>✓</span> Strictly Admin-authenticated commands (@bot start / @bot disconnect)</li>
+      <li><span>✓</span> 100% voice transmission — zero text channel clutter</li>
+    </ul>
+  </div>
+
+  <script>
+    document.getElementById('pingUrl').textContent = window.location.origin + '/ping';
+    function copyPing() {
+      navigator.clipboard.writeText(window.location.origin + '/ping');
+      alert('Copied ping URL to clipboard!');
+    }
+  </script>
+</body>
+</html>

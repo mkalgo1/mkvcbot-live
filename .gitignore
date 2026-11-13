@@ -1,0 +1,10 @@
+.env
+*.mp3
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+dist/
+build/
+.DS_Store

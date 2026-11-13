@@ -1,0 +1,8 @@
+version: '3.8'
+
+services:
+  mkvcbot:
+    build: .
+    restart: always
+    env_file:
+      - .env
