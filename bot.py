@@ -1,11 +1,11 @@
 """
 MKVCBot - Discord Voice Bot for MKTRADEZ
-- Speaks high-impact Order Flow / Option Flow audio message in VC.
-- Loops continuously as long as human members are present in the channel.
-- Goes silent when alone in the VC; automatically resumes when someone joins.
-- Tagged commands: @bot start, @bot disconnect (or @bot diconnect).
-- Strictly admin-only (Administrator or Guild Owner required).
-- Completely silent in text (sends zero text messages).
+- Speaks user-provided audio file ('audio.mp3' / 'audio.pcm') in an INFINITE seamless loop.
+- Automatically stays connected 100% of the time.
+- Fully supports Discord's native DAVE E2EE voice protocol.
+- Admin commands: @bot start, @bot disconnect (or @bot diconnect).
+- Strictly Administrator or Guild Owner only.
+- 100% voice transmission — zero text channel clutter.
 """
 
 import os
@@ -13,7 +13,6 @@ import sys
 import shutil
 import asyncio
 import logging
-import glob
 import subprocess
 from typing import Optional
 import discord
@@ -27,34 +26,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MKVCBot")
 
-# Optional TTS engines
-try:
-    import edge_tts
-    HAS_EDGE_TTS = True
-except ImportError:
-    HAS_EDGE_TTS = False
-
-try:
-    from gtts import gTTS
-    HAS_GTTS = True
-except ImportError:
-    HAS_GTTS = False
-
 # Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-TTS_VOICE = os.getenv("TTS_VOICE", "en-US-ChristopherNeural")
-AUDIO_FILE_MP3 = "mktradez_speech.mp3"
-AUDIO_FILE_WAV = "mktradez_speech.wav"
 
-# Script to read
-SPEECH_TEXT = (
-    "MKTRADEZ. "
-    "Your ultimate edge in the modern markets. "
-    "If you are tired of relying on lagging retail indicators that leave you guessing, "
-    "you are in the right place. Our community is built entirely around Order Flow and Option Flow — "
-    "the exact mechanics used by institutional algorithms and market makers to move price."
-)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MP3_FILE = os.path.join(BASE_DIR, "audio.mp3")
+PCM_FILE = os.path.join(BASE_DIR, "audio.pcm")
+WAV_FILE = os.path.join(BASE_DIR, "audio.wav")
+FFMPEG_BIN = os.path.join(BASE_DIR, "ffmpeg.exe") if os.path.exists(os.path.join(BASE_DIR, "ffmpeg.exe")) else "ffmpeg"
 
 intents = discord.Intents.default()
 intents.message_content = True  # Required to read tag commands
@@ -63,185 +43,137 @@ intents.guilds = True
 
 bot = commands.Bot(command_prefix="", intents=intents)
 
-# Per-guild loop state
-guild_loops = {}
+# In-memory PCM audio cache
+CACHED_PCM_BYTES: bytes = b""
 
 
-def find_ffmpeg() -> str:
-    """Finds ffmpeg executable on Windows or Linux."""
-    if os.path.exists("ffmpeg.exe"):
-        return os.path.abspath("ffmpeg.exe")
+class LoopingPCMAudioSource(discord.AudioSource):
+    """
+    Streams raw 48kHz stereo PCM in an infinite, seamless loop directly from memory.
+    Zero ffmpeg process restarts, zero CPU spikes, zero transcode lag.
+    """
+    def __init__(self, pcm_bytes: bytes, pause_seconds: float = 1.0):
+        # 1.0 second natural silence padding between repetitions
+        silence_bytes = b'\x00' * int(48000 * 2 * 2 * pause_seconds)
+        self._data = pcm_bytes + silence_bytes
+        self._length = len(self._data)
+        self._pos = 0
+        self._packets_sent = 0
 
-    ffmpeg_cmd = shutil.which("ffmpeg")
-    if ffmpeg_cmd:
-        return ffmpeg_cmd
+    def read(self) -> bytes:
+        chunk_size = 3840  # Standard Opus frame: 960 samples * 2 channels * 2 bytes (s16le)
+        self._packets_sent += 1
 
-    local_app_data = os.environ.get("LOCALAPPDATA", "")
-    if local_app_data:
-        winget_pattern = os.path.join(local_app_data, "Microsoft", "WinGet", "Packages", "Gyan.FFmpeg*", "*", "bin", "ffmpeg.exe")
-        matches = glob.glob(winget_pattern)
-        if matches:
-            return matches[0]
+        if self._packets_sent % 250 == 0:  # Every ~5 seconds
+            logger.info(f"Voice Stream Active: {self._packets_sent} audio frames transmitted successfully.")
 
-    return "ffmpeg"
+        if self._pos + chunk_size > self._length:
+            remaining = self._data[self._pos:]
+            wrap_needed = chunk_size - len(remaining)
+            chunk = remaining + self._data[:wrap_needed]
+            self._pos = wrap_needed
+            return chunk
+
+        chunk = self._data[self._pos:self._pos + chunk_size]
+        self._pos += chunk_size
+        return chunk
+
+    def is_opus(self) -> bool:
+        return False
 
 
-FFMPEG_EXECUTABLE = find_ffmpeg()
+def convert_and_load_pcm():
+    """Converts audio.mp3 into raw 48kHz stereo 16-bit PCM and loads into RAM."""
+    global CACHED_PCM_BYTES
 
+    if not os.path.exists(MP3_FILE):
+        logger.error(f"Audio file '{MP3_FILE}' not found!")
+        return
 
-async def prepare_audio():
-    """Generates the speech audio file and pre-encodes to 48kHz stereo WAV for Discord."""
-    # 1. Generate MP3 if missing
-    if not os.path.exists(AUDIO_FILE_MP3):
-        logger.info(f"Generating TTS audio file '{AUDIO_FILE_MP3}'...")
-        if HAS_EDGE_TTS:
-            try:
-                communicate = edge_tts.Communicate(SPEECH_TEXT, TTS_VOICE)
-                await communicate.save(AUDIO_FILE_MP3)
-                logger.info("Generated high-quality Edge TTS audio successfully.")
-            except Exception as e:
-                logger.warning(f"Edge TTS failed ({e}), attempting gTTS fallback...")
-
-        if not os.path.exists(AUDIO_FILE_MP3) and HAS_GTTS:
-            try:
-                tts = gTTS(text=SPEECH_TEXT, lang='en', slow=False)
-                tts.save(AUDIO_FILE_MP3)
-                logger.info("Generated gTTS audio fallback successfully.")
-            except Exception as e:
-                logger.error(f"gTTS failed: {e}")
-
-    # 2. Pre-encode to 48kHz stereo 16-bit WAV with volume boost for crystal clear Discord transmission
+    logger.info(f"Pre-encoding '{MP3_FILE}' to 48kHz stereo PCM...")
     try:
         cmd = [
-            FFMPEG_EXECUTABLE,
+            FFMPEG_BIN,
             "-y",
-            "-i", AUDIO_FILE_MP3,
+            "-i", MP3_FILE,
+            "-f", "s16le",
             "-ar", "48000",
             "-ac", "2",
-            "-filter:a", "volume=2.2",
-            AUDIO_FILE_WAV
+            "-filter:a", "volume=2.5",
+            PCM_FILE
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        logger.info(f"Pre-encoded audio to 48kHz stereo WAV '{AUDIO_FILE_WAV}' with +120% volume boost.")
+        logger.info(f"Raw PCM encoded successfully -> {PCM_FILE}")
     except Exception as e:
-        logger.warning(f"Could not pre-encode to WAV ({e}), will use MP3 directly.")
+        logger.error(f"FFmpeg encoding error: {e}")
+
+    if os.path.exists(PCM_FILE):
+        with open(PCM_FILE, "rb") as f:
+            CACHED_PCM_BYTES = f.read()
+        logger.info(f"Loaded {len(CACHED_PCM_BYTES)} bytes of PCM audio into memory. Ready for instant looping.")
 
 
-def get_active_audio_path() -> str:
-    if os.path.exists(AUDIO_FILE_WAV):
-        return os.path.abspath(AUDIO_FILE_WAV)
-    return os.path.abspath(AUDIO_FILE_MP3)
-
-
-def has_humans(vc: discord.VoiceClient) -> bool:
+def has_humans(channel: discord.VoiceChannel) -> bool:
     """Checks if there are non-bot users in the voice channel."""
-    if not vc or not vc.channel:
+    if not channel:
         return False
-    return any(not member.bot for member in vc.channel.members)
+    return any(not member.bot for member in channel.members)
 
 
-async def voice_playback_loop(guild_id: int):
-    """
-    Continuous background loop:
-    - If humans in VC: plays speech in a loop.
-    - If alone: waits silently until someone joins.
-    """
-    logger.info(f"Started voice playback loop for guild {guild_id}")
-    try:
-        while True:
-            guild = bot.get_guild(guild_id)
-            if not guild:
-                break
+def start_infinite_playback(vc: discord.VoiceClient):
+    """Starts or resumes the infinite memory stream 100% reliably."""
+    if not vc or not vc.is_connected():
+        return
 
-            vc: Optional[discord.VoiceClient] = guild.voice_client
-            if not vc or not vc.is_connected():
-                logger.info(f"Voice client disconnected in guild {guild_id}. Ending loop.")
-                break
+    if vc.is_paused():
+        logger.info("Resuming voice playback...")
+        vc.resume()
+        return
 
-            if has_humans(vc):
-                if not vc.is_playing() and not vc.is_paused():
-                    audio_path = get_active_audio_path()
-                    if os.path.exists(audio_path):
-                        done_event = asyncio.Event()
+    if not vc.is_playing():
+        if len(CACHED_PCM_BYTES) == 0:
+            convert_and_load_pcm()
 
-                        def after_playback(error):
-                            if error:
-                                logger.error(f"Playback error: {error}")
-                            bot.loop.call_soon_threadsafe(done_event.set)
-
-                        try:
-                            source = discord.FFmpegPCMAudio(
-                                audio_path,
-                                executable=FFMPEG_EXECUTABLE
-                            )
-                            logger.info(f"Speaking text in VC '{vc.channel.name}'...")
-                            vc.play(source, after=after_playback)
-
-                            # Wait for audio to finish, with a 35s safety timeout
-                            try:
-                                await asyncio.wait_for(done_event.wait(), timeout=35.0)
-                            except asyncio.TimeoutError:
-                                logger.warning("Playback timeout reached, cycling loop.")
-
-                        except Exception as e:
-                            logger.error(f"Error starting audio play: {e}")
-                            await asyncio.sleep(2)
-
-                        # Natural pause between speech loops
-                        await asyncio.sleep(2)
-                    else:
-                        logger.warning(f"Audio file '{audio_path}' missing. Regenerating...")
-                        await prepare_audio()
-                        await asyncio.sleep(3)
-                else:
-                    await asyncio.sleep(1)
-            else:
-                # Bot is alone in VC: stop playback and wait silently
-                if vc.is_playing():
-                    logger.info("Bot is alone in VC. Pausing audio until a member joins.")
-                    vc.stop()
-                await asyncio.sleep(2)
-
-    except asyncio.CancelledError:
-        logger.info(f"Voice loop cancelled for guild {guild_id}")
-    except Exception as e:
-        logger.error(f"Unexpected error in voice loop: {e}", exc_info=True)
-
-
-def ensure_voice_loop(guild_id: int):
-    """Ensures an active loop exists for the given guild."""
-    current_task = guild_loops.get(guild_id)
-    if current_task is None or current_task.done():
-        guild_loops[guild_id] = asyncio.create_task(voice_playback_loop(guild_id))
+        if len(CACHED_PCM_BYTES) > 0:
+            source = LoopingPCMAudioSource(CACHED_PCM_BYTES, pause_seconds=1.0)
+            logger.info(f"Starting 100% INFINITE playback loop in '{vc.channel.name}'...")
+            logger.info(f"Active Voice Mode: {vc.mode} | DaveVersion: {getattr(vc._connection, 'dave_protocol_version', 'N/A')}")
+            vc.play(source)
 
 
 @bot.event
 async def on_ready():
     logger.info(f"====== MKVCBOT IS ONLINE ======")
     logger.info(f"Logged in as: {bot.user.name}#{bot.user.discriminator} (ID: {bot.user.id})")
-    logger.info(f"Connected to {len(bot.guilds)} server(s): {[g.name for g in bot.guilds]}")
-    logger.info(f"FFmpeg executable: {FFMPEG_EXECUTABLE}")
-    await prepare_audio()
-    logger.info("Ready to receive '@bot start' command from Server Admins.")
+    logger.info(f"Guilds connected: {[g.name for g in bot.guilds]}")
+    convert_and_load_pcm()
+    logger.info("Bot is ready and listening for '@bot start' command.")
 
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     """
-    Monitors user movement in voice channels to start or pause speech automatically.
+    Monitors user movement in voice channels:
+    - If humans are present: plays/resumes audio.
+    - If alone: pauses audio and stays silent.
     """
     guild = member.guild
     vc: Optional[discord.VoiceClient] = guild.voice_client
     if not vc or not vc.channel:
         return
 
-    # Check if this change happened in the bot's channel
+    # Check if event happened in the channel where the bot is
     if before.channel == vc.channel or after.channel == vc.channel:
-        if has_humans(vc):
-            ensure_voice_loop(guild.id)
+        if has_humans(vc.channel):
+            if vc.is_paused():
+                logger.info("Human detected in VC. Resuming audio playback.")
+                vc.resume()
+            elif not vc.is_playing():
+                start_infinite_playback(vc)
         else:
-            if vc.is_playing():
-                vc.stop()
+            if vc.is_playing() and not vc.is_paused():
+                logger.info("Bot is alone in VC. Pausing audio until someone joins.")
+                vc.pause()
 
 
 @bot.event
@@ -263,7 +195,7 @@ async def on_message(message: discord.Message):
     # STRICT SECURITY CHECK: Must have Administrator permission or be server owner
     is_admin = message.author.guild_permissions.administrator or (message.author.id == message.guild.owner_id)
     if not is_admin:
-        logger.warning(f"Ignored non-admin mention from {message.author.name}")
+        logger.warning(f"Ignored unauthorized mention from {message.author.name}")
         return
 
     content_clean = message.content.lower().replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
@@ -273,7 +205,7 @@ async def on_message(message: discord.Message):
     if "start" in content_clean:
         if message.author.voice and message.author.voice.channel:
             target_channel = message.author.voice.channel
-            logger.info(f"Joining voice channel: '{target_channel.name}'")
+            logger.info(f"Connecting to voice channel: '{target_channel.name}'...")
             vc: Optional[discord.VoiceClient] = message.guild.voice_client
 
             if vc and vc.is_connected():
@@ -281,12 +213,17 @@ async def on_message(message: discord.Message):
                     await vc.move_to(target_channel)
             else:
                 try:
-                    vc = await target_channel.connect(reconnect=True, timeout=20.0)
+                    vc = await target_channel.connect(reconnect=True, timeout=30.0, self_deaf=False, self_mute=False)
                 except Exception as e:
-                    logger.error(f"Failed to connect to voice channel: {e}")
+                    logger.error(f"Failed to connect to voice channel: {e}", exc_info=True)
                     return
 
-            ensure_voice_loop(message.guild.id)
+            # Check permissions
+            perms = target_channel.permissions_for(message.guild.me)
+            logger.info(f"Channel Permissions -> Connect: {perms.connect}, Speak: {perms.speak}")
+
+            # Immediately start speaking 100%
+            start_infinite_playback(vc)
         else:
             logger.warning(f"Admin {message.author.name} issued start but is not currently in a voice channel.")
 
@@ -295,10 +232,7 @@ async def on_message(message: discord.Message):
         vc: Optional[discord.VoiceClient] = message.guild.voice_client
         if vc and vc.is_connected():
             logger.info("Disconnecting from voice channel...")
-            task = guild_loops.pop(message.guild.id, None)
-            if task and not task.done():
-                task.cancel()
-            if vc.is_playing():
+            if vc.is_playing() or vc.is_paused():
                 vc.stop()
             await vc.disconnect()
 
